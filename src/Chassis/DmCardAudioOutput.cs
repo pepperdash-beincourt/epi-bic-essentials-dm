@@ -24,10 +24,10 @@ namespace PepperDash.Essentials.DM
         ushort PreMuteVolumeLevel;
         bool IsMuted;
 
-        public DmCardAudioOutputController(Audio.Output output)
+        public DmCardAudioOutputController(string key, string name, Audio.Output output)
         {
-            Key = "dmCardAudioOutput";
-            Name = "DM Card Audio Output";
+            Key = key;
+            Name = name;
             Output = output;
             VolumeLevelFeedback = new IntFeedback(() => Output.VolumeFeedback.UShortValue);
             MuteFeedback = new BoolFeedback(() => IsMuted);
