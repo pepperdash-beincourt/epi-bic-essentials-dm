@@ -14,12 +14,13 @@ using PepperDash.Core;
 using PepperDash.Essentials.Core;
 using PepperDash.Essentials.Core.Bridges;
 using PepperDash.Essentials.DM.Config;
+using PepperDash.Essentials.DM.Routing;
 
 using Feedback = PepperDash.Essentials.Core.Feedback;
 
 namespace PepperDash.Essentials.DM
 {
-    public class DmpsRoutingController : EssentialsBridgeableDevice, IRoutingMidpointWithFeedback, IHasFeedback
+    public class DmpsRoutingController : EssentialsBridgeableDevice, IRoutingMidpointWithFeedback, IHasNamedRoutingSlots, IHasFeedback
     {
         private const string NonePortKey = "none";
 
@@ -29,6 +30,15 @@ namespace PepperDash.Essentials.DM
 
         //IroutingNumericEvent
         public event EventHandler<RoutingNumericEventArgs> NumericSwitchChange;
+
+        // Named-slot view over InputPorts/OutputPorts for IHasNamedRoutingSlots, fed from the same
+        // switch-change feedback as CurrentRoutes.
+        private RoutingPortNamedSlots _namedSlots;
+
+        IReadOnlyDictionary<string, IRoutingSlotInfo> IHasNamedRoutingSlots.InputSlots =>
+            _namedSlots?.InputSlots ?? new Dictionary<string, IRoutingSlotInfo>();
+        IReadOnlyDictionary<string, IRoutingOutputSlotInfo> IHasNamedRoutingSlots.OutputSlots =>
+            _namedSlots?.OutputSlots ?? new Dictionary<string, IRoutingOutputSlotInfo>();
 
         //Feedback for DMPS System Control
         public BoolFeedback SystemPowerOnFeedback { get; private set; }
@@ -116,6 +126,8 @@ namespace PepperDash.Essentials.DM
             var descriptor = new RouteSwitchDescriptor(e.OutputPort, e.InputPort);
             if (e.InputPort != null)
                 CurrentRoutes.Add(descriptor);
+
+            _namedSlots?.HandleRouteChange(e.OutputPort, e.InputPort, e.SigType);
 
             var handler = RouteChanged;
             handler?.Invoke(this, descriptor);
@@ -246,6 +258,7 @@ namespace PepperDash.Essentials.DM
             Dmps.DMInputChange += Dmps_DMInputChange;
             Dmps.DMOutputChange += Dmps_DMOutputChange;
             Dmps.DMSystemChange += Dmps_DMSystemChange;
+            _namedSlots = new RoutingPortNamedSlots(InputPorts, OutputPorts);
             
             foreach (var x in VideoOutputFeedbacks)
             {
@@ -1215,8 +1228,10 @@ namespace PepperDash.Essentials.DM
 
                 Debug.LogVerbose(this, "Attempting a DM route from input {0} to output {1} {2}", inputSelector, outputSelector, sigType);
 
-                var input = inputSelector as DMInput;
-                var output = outputSelector as DMOutput;
+                // Selector may be the port's own Selector object or, from mobile control's
+                // matrix routing, the named slot key (= port key). See RoutingSelectorResolver.
+                var input = RoutingSelectorResolver.Resolve<DMInput>(inputSelector, InputPorts);
+                var output = RoutingSelectorResolver.Resolve<DMOutput>(outputSelector, OutputPorts);
 
                 if (output == null)
                 {

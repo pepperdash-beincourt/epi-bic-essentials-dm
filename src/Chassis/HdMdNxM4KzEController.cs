@@ -10,15 +10,25 @@ using PepperDash.Essentials.Core;
 using PepperDash.Essentials.Core.Bridges;
 using PepperDash.Essentials.Core.Config;
 using PepperDash.Essentials.DM.Config;
+using PepperDash.Essentials.DM.Routing;
 
 namespace PepperDash.Essentials.DM.Chassis
 {
 	[Description("Wrapper class for HD-MD-NxM-4KZ-E switchers")]
-	public class HdMdNxM4kzEController : CrestronGenericBridgeableBaseDevice, IRoutingMidpointWithFeedback, IHasFeedback
+	public class HdMdNxM4kzEController : CrestronGenericBridgeableBaseDevice, IRoutingMidpointWithFeedback, IHasNamedRoutingSlots, IHasFeedback
 	{
 		private readonly HdMdNxM4kzE _chassis;
 
 		public event EventHandler<RoutingNumericEventArgs> NumericSwitchChange;
+
+		// Named-slot view over InputPorts/OutputPorts for IHasNamedRoutingSlots, fed from the same
+		// switch-change feedback as CurrentRoutes.
+		private RoutingPortNamedSlots _namedSlots;
+
+		IReadOnlyDictionary<string, IRoutingSlotInfo> IHasNamedRoutingSlots.InputSlots =>
+			_namedSlots?.InputSlots ?? new Dictionary<string, IRoutingSlotInfo>();
+		IReadOnlyDictionary<string, IRoutingOutputSlotInfo> IHasNamedRoutingSlots.OutputSlots =>
+			_namedSlots?.OutputSlots ?? new Dictionary<string, IRoutingOutputSlotInfo>();
 
 		public Dictionary<uint, string> InputNames { get; set; }
 		public Dictionary<uint, string> OutputNames { get; set; }
@@ -120,6 +130,8 @@ namespace PepperDash.Essentials.DM.Chassis
 			_chassis.DMInputChange += Chassis_DMInputChange;
 			_chassis.DMOutputChange += Chassis_DMOutputChange;
 
+			_namedSlots = new RoutingPortNamedSlots(InputPorts, OutputPorts);
+
 			AddPostActivationAction(AddFeedbackCollections);
 		}
 
@@ -169,6 +181,8 @@ namespace PepperDash.Essentials.DM.Chassis
 			var descriptor = new RouteSwitchDescriptor(e.OutputPort, e.InputPort);
 			if (e.InputPort != null)
 				CurrentRoutes.Add(descriptor);
+
+			_namedSlots?.HandleRouteChange(e.OutputPort, e.InputPort, e.SigType);
 
 			var handler = RouteChanged;
 			handler?.Invoke(this, descriptor);
@@ -274,8 +288,10 @@ namespace PepperDash.Essentials.DM.Chassis
 
 		public void ExecuteSwitch(object inputSelector, object outputSelector, eRoutingSignalType signalType)
 		{
-			var input = inputSelector as HdMdNxM4kzEHdmiInput;
-			var output = outputSelector as HdMdNxM4kzEHdmiOutput;
+			// Selector may be the port's own Selector object or, from mobile control's matrix
+			// routing, the named slot key (= port key). See RoutingSelectorResolver.
+			var input = RoutingSelectorResolver.Resolve<HdMdNxM4kzEHdmiInput>(inputSelector, InputPorts);
+			var output = RoutingSelectorResolver.Resolve<HdMdNxM4kzEHdmiOutput>(outputSelector, OutputPorts);
 
 			Debug.LogVerbose(this, "ExecuteSwitch: input={0} output={1}", input, output);
 

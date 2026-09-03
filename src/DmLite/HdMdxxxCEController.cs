@@ -13,6 +13,7 @@ using PepperDash.Core;
 using PepperDash.Essentials.Core;
 using PepperDash.Essentials.Core.Bridges;
 using PepperDash.Essentials.Core.Config;
+using PepperDash.Essentials.DM.Routing;
 
 namespace PepperDash.Essentials.DM
 {
@@ -20,7 +21,7 @@ namespace PepperDash.Essentials.DM
     /// Represent both a transmitter and receiver pair of the HD-MD-400-C-E / HD-MD-300-C-E / HD-MD-200-C-E kits
     /// </summary>
     [Description("Wrapper class for all HD-MD variants")]
-    public class HdMdxxxCEController : CrestronGenericBridgeableBaseDevice, IRoutingMidpointWithFeedback//, IComPorts
+    public class HdMdxxxCEController : CrestronGenericBridgeableBaseDevice, IRoutingMidpointWithFeedback, IHasNamedRoutingSlots//, IComPorts
     {
         /// <summary>
         /////  DmLite Ports
@@ -68,6 +69,15 @@ namespace PepperDash.Essentials.DM
         {
             get { return new RoutingPortCollection<RoutingOutputPort> { HdmiOut }; }
         }
+
+        // Named-slot view over InputPorts/OutputPorts for IHasNamedRoutingSlots, fed from the single
+        // HDMI output's source feedback (see TxRxPair_DMOutputChange).
+        private RoutingPortNamedSlots _namedSlots;
+
+        IReadOnlyDictionary<string, IRoutingSlotInfo> IHasNamedRoutingSlots.InputSlots =>
+            _namedSlots?.InputSlots ?? new Dictionary<string, IRoutingSlotInfo>();
+        IReadOnlyDictionary<string, IRoutingOutputSlotInfo> IHasNamedRoutingSlots.OutputSlots =>
+            _namedSlots?.OutputSlots ?? new Dictionary<string, IRoutingOutputSlotInfo>();
 
         public HdMdxxxCEController(string key, string name, HdMdxxxCE txRxPair)
             :base(key, name, txRxPair)
@@ -150,6 +160,8 @@ namespace PepperDash.Essentials.DM
             TxRxPair.DMSystemChange += new DMSystemEventHandler(TxRxPair_DMSystemChange);
 
             VideoSourceFeedback = new IntFeedback(() => (int)TxRxPair.HdmiOutputs[1].VideoOutFeedback.Number);
+
+            _namedSlots = new RoutingPortNamedSlots(InputPorts, OutputPorts);
         }
 
         void TxRxPair_DMSystemChange(Switch device, DMSystemEventArgs args)
@@ -167,7 +179,16 @@ namespace PepperDash.Essentials.DM
         void TxRxPair_DMOutputChange(Switch device, DMOutputEventArgs args)
         {
             if (args.EventId == DMOutputEventIds.VideoOutEventId)
+            {
                 VideoSourceFeedback.FireUpdate();
+
+                var sourceNumber = TxRxPair.HdmiOutputs[1].VideoOutFeedback == null
+                    ? 0 : TxRxPair.HdmiOutputs[1].VideoOutFeedback.Number;
+                var inputPort = sourceNumber == 0
+                    ? null
+                    : InputPorts.FirstOrDefault(p => p.Selector is int sel && (uint)sel == sourceNumber);
+                _namedSlots?.HandleRouteChange(HdmiOut, inputPort, eRoutingSignalType.AudioVideo);
+            }
         }
 
         void TxRxPair_DMInputChange(Switch device, DMInputEventArgs args)
@@ -208,7 +229,23 @@ namespace PepperDash.Essentials.DM
 
         public void ExecuteSwitch(object inputSelector, object outputSelector, eRoutingSignalType signalType)
         {
-            var number = Convert.ToUInt32(inputSelector); // Cast can sometimes fail
+            // Selector may be the port's own Selector (a slot number) or, from mobile control's
+            // matrix routing, the named slot key (= port key). See RoutingSelectorResolver.
+            var resolved = RoutingSelectorResolver.ResolveSelector(inputSelector, InputPorts);
+
+            uint number;
+
+            try
+            {
+                number = Convert.ToUInt32(resolved);
+            }
+            catch (Exception ex)
+            {
+                // Previously threw straight out of the messenger action for any non-numeric input.
+                Debug.LogInformation(this, "Unable to execute switch for inputSelector {0}: {1}",
+                    inputSelector, ex.Message);
+                return;
+            }
 
             var input = number == 0 ? null : TxRxPair.Inputs[number];
 
