@@ -8,7 +8,7 @@
 | Repository | `PepperDash.Essentials.DM` |
 | Source file | [`src/Routing/IDmOutputSlot.cs`](../../../src/Routing/IDmOutputSlot.cs) |
 | Language | C# |
-| Declaration | `interface IDmOutputSlot` with declared base/contract list `IKeyName` |
+| Declaration | `interface IDmOutputSlot` with declared base/contract list `IRoutingOutputSlotInfo` |
 | Accessibility | `public` |
 | Namespace/module | `PepperDash.Essentials.DM.Routing` |
 
@@ -22,7 +22,7 @@ The type exists to provide a named boundary in the codebase. Its inheritance, im
 
 ## How it works
 
-Preserve the declared inheritance/contract relationship: `IKeyName`. Use repository search to identify callers, implementers, serializers, tests, and configuration references before changing a public name or shape.
+Preserve the declared inheritance/contract relationship: `IRoutingOutputSlotInfo`. Use repository search to identify callers, implementers, serializers, tests, and configuration references before changing a public name or shape.
 
 ## When to modify it
 
