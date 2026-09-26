@@ -15,6 +15,7 @@ using PepperDash.Core;
 using PepperDash.Essentials.Core;
 using PepperDash.Essentials.Core.Bridges;
 using PepperDash.Essentials.DM.Config;
+using PepperDash.Essentials.DM.Routing;
 
 namespace PepperDash.Essentials.DM
 {
@@ -22,7 +23,7 @@ namespace PepperDash.Essentials.DM
     /// Builds a controller for basic DM-RMCs with Com and IR ports and no control functions
     /// 
     /// </summary>
-	public class DmBladeChassisController : CrestronGenericBridgeableBaseDevice, IDmSwitchWithEndpointOnlineFeedback, IRoutingNumericWithFeedback
+	public class DmBladeChassisController : CrestronGenericBridgeableBaseDevice, IDmSwitchWithEndpointOnlineFeedback, IRoutingMidpointWithFeedback, IHasNamedRoutingSlots
     {
         private const string NonePortKey = "inputCard0--None";
 
@@ -32,6 +33,15 @@ namespace PepperDash.Essentials.DM
 
         //IroutingNumericEvent
         public event EventHandler<RoutingNumericEventArgs> NumericSwitchChange;
+
+        // Named-slot view over InputPorts/OutputPorts for IHasNamedRoutingSlots, fed from the same
+        // switch-change feedback as CurrentRoutes.
+        private RoutingPortNamedSlots _namedSlots;
+
+        IReadOnlyDictionary<string, IRoutingSlotInfo> IHasNamedRoutingSlots.InputSlots =>
+            _namedSlots?.InputSlots ?? new Dictionary<string, IRoutingSlotInfo>();
+        IReadOnlyDictionary<string, IRoutingOutputSlotInfo> IHasNamedRoutingSlots.OutputSlots =>
+            _namedSlots?.OutputSlots ?? new Dictionary<string, IRoutingOutputSlotInfo>();
 
         // Feedbacks for EssentialDM
         public Dictionary<uint, IntFeedback> VideoOutputFeedbacks { get; private set; }
@@ -155,6 +165,7 @@ namespace PepperDash.Essentials.DM
             IsOnline.OutputChange += new EventHandler<FeedbackEventArgs>(IsOnline_OutputChange);
             Chassis.DMInputChange += new DMInputEventHandler(Chassis_DMInputChange);
             Chassis.DMOutputChange += new DMOutputEventHandler(Chassis_DMOutputChange);
+            _namedSlots = new RoutingPortNamedSlots(InputPorts, OutputPorts);
             VideoOutputFeedbacks = new Dictionary<uint, IntFeedback>();
             UsbOutputRoutedToFeebacks = new Dictionary<uint, IntFeedback>();
             UsbInputRoutedToFeebacks = new Dictionary<uint, IntFeedback>();
@@ -343,7 +354,52 @@ namespace PepperDash.Essentials.DM
         {
             var newEvent = NumericSwitchChange;
             if (newEvent != null) newEvent(this, e);
+            UpdateCurrentRoute(e);
         }
+
+        #region IRoutingMidpointWithFeedback Members
+
+        /// <summary>
+        /// Currently active routes, per IRoutingMidpointWithFeedback. Maintained from the device's
+        /// switch-change feedback (see UpdateCurrentRoute / OnSwitchChange).
+        /// </summary>
+        public List<RouteSwitchDescriptor> CurrentRoutes { get; } = new List<RouteSwitchDescriptor>();
+
+        /// <summary>
+        /// Raised when a route changes, per IRoutingMidpointWithFeedback.
+        /// </summary>
+        public event RouteChangedEventHandler RouteChanged;
+
+        /// <summary>
+        /// Clears the route to an output by switching a null input (no source) to it.
+        /// </summary>
+        public void ClearRoute(object outputSelector, eRoutingSignalType signalType)
+        {
+            ExecuteSwitch(null, outputSelector, signalType);
+        }
+
+        /// <summary>
+        /// Maintains <see cref="CurrentRoutes"/> and raises <see cref="RouteChanged"/> from a numeric
+        /// switch-change event so the feedback surface tracks the same routes as NumericSwitchChange.
+        /// </summary>
+        private void UpdateCurrentRoute(RoutingNumericEventArgs e)
+        {
+            if (e == null || e.OutputPort == null)
+                return;
+
+            CurrentRoutes.RemoveAll(r => ReferenceEquals(r.OutputPort, e.OutputPort));
+
+            var descriptor = new RouteSwitchDescriptor(e.OutputPort, e.InputPort);
+            if (e.InputPort != null)
+                CurrentRoutes.Add(descriptor);
+
+            _namedSlots?.HandleRouteChange(e.OutputPort, e.InputPort, e.SigType);
+
+            var handler = RouteChanged;
+            handler?.Invoke(this, descriptor);
+        }
+
+        #endregion
 
 
         void AddHdmiInBladePorts(uint number, ICec cecPort)
@@ -515,7 +571,7 @@ namespace PepperDash.Essentials.DM
         /// </summary>
         void AddVolumeControl(uint number, Audio.Output audio)
         {
-            VolumeControls.Add(number, new DmCardAudioOutputController(audio));
+            VolumeControls.Add(number, new DmCardAudioOutputController(string.Format("{0}-audioOutput{1}", Key, number), string.Format("{0} Audio Output {1}", Name, number), audio));
         }
 
         //public void SetInputHdcpSupport(uint input, ePdtHdcpSupport hdcpSetting)
@@ -683,8 +739,10 @@ namespace PepperDash.Essentials.DM
         {
             Debug.LogVerbose(this, "Making an awesome DM route from {0} to {1} {2}", inputSelector, outputSelector, sigType);
 
-            var input = inputSelector as DMInput; // Cast can sometimes fail
-            var output = outputSelector as DMOutput;
+            // Selector may be the port's own Selector object or, from mobile control's matrix
+            // routing, the named slot key (= port key). See RoutingSelectorResolver.
+            var input = RoutingSelectorResolver.Resolve<DMInput>(inputSelector, InputPorts);
+            var output = RoutingSelectorResolver.Resolve<DMOutput>(outputSelector, OutputPorts);
 
 
             if (output == null)

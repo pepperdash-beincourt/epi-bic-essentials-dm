@@ -10,6 +10,7 @@ using Crestron.SimplSharpPro.DM;
 using PepperDash.Core;
 using PepperDash.Essentials.Core;
 using PepperDash.Essentials.DM.Config;
+using PepperDash.Essentials.DM.Routing;
 using Crestron.SimplSharpPro.DM.Cards;
 using PepperDash.Essentials.Core.Bridges;
 using PepperDash.Essentials.Core.Config;
@@ -17,7 +18,7 @@ using PepperDash.Essentials.Core.Config;
 namespace PepperDash.Essentials.DM.Chassis
 {
 	[Description("Wrapper class for all HdMd8xN switchers")]
-	public class HdMd8xNController : CrestronGenericBridgeableBaseDevice, IRoutingNumericWithFeedback, IHasFeedback
+	public class HdMd8xNController : CrestronGenericBridgeableBaseDevice, IRoutingMidpointWithFeedback, IHasNamedRoutingSlots, IHasFeedback
 	{
 		private HdMd8xN _Chassis;
 
@@ -28,6 +29,15 @@ namespace PepperDash.Essentials.DM.Chassis
 
 		public RoutingPortCollection<RoutingInputPort> InputPorts { get; private set; }
 		public RoutingPortCollection<RoutingOutputPort> OutputPorts { get; private set; }
+
+		// Named-slot view over InputPorts/OutputPorts for IHasNamedRoutingSlots (mobile-control matrix
+		// routing). Route state is fed from the same switch-change feedback as CurrentRoutes.
+		private RoutingPortNamedSlots _namedSlots;
+
+		IReadOnlyDictionary<string, IRoutingSlotInfo> IHasNamedRoutingSlots.InputSlots =>
+			_namedSlots?.InputSlots ?? new Dictionary<string, IRoutingSlotInfo>();
+		IReadOnlyDictionary<string, IRoutingOutputSlotInfo> IHasNamedRoutingSlots.OutputSlots =>
+			_namedSlots?.OutputSlots ?? new Dictionary<string, IRoutingOutputSlotInfo>();
 
 		public FeedbackCollection<BoolFeedback> VideoInputSyncFeedbacks { get; private set; }
 		public FeedbackCollection<IntFeedback> VideoOutputRouteFeedbacks { get; private set; }
@@ -145,6 +155,8 @@ namespace PepperDash.Essentials.DM.Chassis
 			_Chassis.DMInputChange += Chassis_DMInputChange;
 			_Chassis.DMOutputChange += Chassis_DMOutputChange;
 
+			_namedSlots = new RoutingPortNamedSlots(InputPorts, OutputPorts);
+
 			AddPostActivationAction(AddFeedbackCollections);
 		}
 		#endregion
@@ -159,7 +171,53 @@ namespace PepperDash.Essentials.DM.Chassis
 		{
 			var newEvent = NumericSwitchChange;
 			if (newEvent != null) newEvent(this, e);
+			UpdateCurrentRoute(e);
 		}
+
+		#region IRoutingMidpointWithFeedback Members
+
+		/// <summary>
+		/// Currently active routes, per IRoutingMidpointWithFeedback. Maintained from the device's
+		/// switch-change feedback (see UpdateCurrentRoute / OnSwitchChange).
+		/// </summary>
+		public List<RouteSwitchDescriptor> CurrentRoutes { get; } = new List<RouteSwitchDescriptor>();
+
+		/// <summary>
+		/// Raised when a route changes, per IRoutingMidpointWithFeedback.
+		/// </summary>
+		public event RouteChangedEventHandler RouteChanged;
+
+		/// <summary>
+		/// Clears the route to an output by switching a null input (no source) to it.
+		/// </summary>
+		public void ClearRoute(object outputSelector, eRoutingSignalType signalType)
+		{
+			ExecuteSwitch(null, outputSelector, signalType);
+		}
+
+		/// <summary>
+		/// Maintains <see cref="CurrentRoutes"/> and raises <see cref="RouteChanged"/> from a numeric
+		/// switch-change event so the feedback surface tracks the same routes as NumericSwitchChange.
+		/// </summary>
+		private void UpdateCurrentRoute(RoutingNumericEventArgs e)
+		{
+			if (e == null || e.OutputPort == null)
+				return;
+
+			CurrentRoutes.RemoveAll(r => ReferenceEquals(r.OutputPort, e.OutputPort));
+
+			var descriptor = new RouteSwitchDescriptor(e.OutputPort, e.InputPort);
+			if (e.InputPort != null)
+				CurrentRoutes.Add(descriptor);
+
+			// Keep the named-slot view in sync per signal type (CurrentRoutes above collapses A/V).
+			_namedSlots?.HandleRouteChange(e.OutputPort, e.InputPort, e.SigType);
+
+			var handler = RouteChanged;
+			handler?.Invoke(this, descriptor);
+		}
+
+		#endregion
 
 		#region PostActivate
 
@@ -244,7 +302,13 @@ namespace PepperDash.Essentials.DM.Chassis
 		{
 			if (newFb == null) return;
 
-			if (!Feedbacks.Contains(newFb))
+			// Feedbacks.Contains(newFb) checks by reference (FeedbackCollection<T> derives from
+			// Collection<T>, whose default Contains is reference-equality), which never catches a
+			// *different* Feedback instance that happens to share the same Key as one already added
+			// (e.g. VideoInputSyncFeedbacks and InputNameFeedbacks both keyed by the same input name) -
+			// that duplicate key would throw when merged into this shared collection. Check by key via
+			// the collection's own indexer instead.
+			if (string.IsNullOrEmpty(newFb.Key) || Feedbacks[newFb.Key] == null)
 			{
 				Feedbacks.Add(newFb);
 			}
@@ -256,8 +320,10 @@ namespace PepperDash.Essentials.DM.Chassis
 
 		public void ExecuteSwitch(object inputSelector, object outputSelector, eRoutingSignalType sigType)
 		{		    
-            var input = inputSelector as DMInput;
-		    var output = outputSelector as DMOutput;
+            // Selector may be the port's own Selector object or, from mobile control's matrix
+            // routing, the named slot key (= port key). See RoutingSelectorResolver.
+            var input = RoutingSelectorResolver.Resolve<DMInput>(inputSelector, InputPorts);
+		    var output = RoutingSelectorResolver.Resolve<DMOutput>(outputSelector, OutputPorts);
             Debug.LogVerbose(this, "ExecuteSwitch: input={0} output={1} sigType={2}", input, output, sigType.ToString());
 
 		    if (output == null)
@@ -486,7 +552,7 @@ namespace PepperDash.Essentials.DM.Chassis
 		{
 			public HdMd8xNControllerFactory()
 			{
-                MinimumEssentialsFrameworkVersion = "2.4.5";
+                MinimumEssentialsFrameworkVersion = "3.0.0";
                 TypeNames = new List<string>() { "hdmd8x2", "hdmd8x1" };
 			}
 

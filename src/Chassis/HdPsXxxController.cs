@@ -11,11 +11,12 @@ using PepperDash.Essentials.Core;
 using PepperDash.Essentials.Core.Bridges;
 using PepperDash.Essentials.Core.Config;
 using PepperDash_Essentials_DM.Config;
+using PepperDash.Essentials.DM.Routing;
 
 namespace PepperDash_Essentials_DM.Chassis
 {
 	[Description("Wrapper class for all HdPsXxx switchers")]
-	public class HdPsXxxController : CrestronGenericBridgeableBaseDevice, IRoutingNumericWithFeedback, IRoutingHasVideoInputSyncFeedbacks
+	public class HdPsXxxController : CrestronGenericBridgeableBaseDevice, IRoutingMidpointWithFeedback, IHasNamedRoutingSlots, IRoutingHasVideoInputSyncFeedbacks
 	{
 		private readonly HdPsXxx _chassis;
 
@@ -24,6 +25,8 @@ namespace PepperDash_Essentials_DM.Chassis
 
 		public Dictionary<uint, string> InputNames { get; set; }
 		public Dictionary<uint, string> OutputNames { get; set; }
+		public Dictionary<uint, HdPsAudioOutputController> VolumeControls { get; private set; }
+		public Dictionary<uint, HdPsAnalogAuxOutputController> AnalogAuxVolumeControls { get; private set; }
 
 		public FeedbackCollection<StringFeedback> InputNameFeedbacks { get; private set; }
 		public FeedbackCollection<BoolFeedback> InputHdcpEnableFeedback { get; private set; }
@@ -39,6 +42,15 @@ namespace PepperDash_Essentials_DM.Chassis
 
 		public event EventHandler<RoutingNumericEventArgs> NumericSwitchChange;
 		public event EventHandler<DMInputEventArgs> DmInputChange;
+
+		// Named-slot view over InputPorts/OutputPorts for IHasNamedRoutingSlots, fed from the same
+		// switch-change feedback as CurrentRoutes.
+		private RoutingPortNamedSlots _namedSlots;
+
+		IReadOnlyDictionary<string, IRoutingSlotInfo> IHasNamedRoutingSlots.InputSlots =>
+			_namedSlots?.InputSlots ?? new Dictionary<string, IRoutingSlotInfo>();
+		IReadOnlyDictionary<string, IRoutingOutputSlotInfo> IHasNamedRoutingSlots.OutputSlots =>
+			_namedSlots?.OutputSlots ?? new Dictionary<string, IRoutingOutputSlotInfo>();
 
 
 		/// <summary>
@@ -69,6 +81,8 @@ namespace PepperDash_Essentials_DM.Chassis
 			OutputNameFeedbacks = new FeedbackCollection<StringFeedback>();
 			OutputRouteNameFeedback = new FeedbackCollection<StringFeedback>();
 			OutputNames = new Dictionary<uint, string>();
+			VolumeControls = new Dictionary<uint, HdPsAudioOutputController>();
+			AnalogAuxVolumeControls = new Dictionary<uint, HdPsAnalogAuxOutputController>();
 
 			VideoInputSyncFeedbacks = new FeedbackCollection<BoolFeedback>();
 			VideoOutputRouteFeedbacks = new FeedbackCollection<IntFeedback>();
@@ -81,6 +95,14 @@ namespace PepperDash_Essentials_DM.Chassis
 
 			OutputNames = props.Outputs;
 			SetupOutputs(OutputNames);
+
+			foreach (var mixer in _chassis.AnalogAuxiliaryMixer)
+			{
+				var control = new HdPsAnalogAuxOutputController(string.Format("{0}-analogAux{1}-mixer", Key, mixer.MixerNumber),
+					string.Format("Auxiliary Audio Output {0}", mixer.MixerNumber), mixer);
+				AnalogAuxVolumeControls.Add(mixer.MixerNumber, control);
+				DeviceManager.AddDevice(control);
+			}
 		}
 
 		// input setup
@@ -195,9 +217,19 @@ namespace PepperDash_Essentials_DM.Chassis
 
 				VideoOutputRouteFeedbacks.Add(new IntFeedback(index.ToString(CultureInfo.InvariantCulture), 
 					() => output.VideoOutFeedback == null ? 0 : (int)output.VideoOutFeedback.Number));
+
+				if (output.Mixer != null)
+				{
+					var control = new HdPsAudioOutputController(string.Format("{0}-output{1}-mixer", Key, index),
+						string.Format("Output Audio Control {0}", index), output.Mixer);
+					VolumeControls.Add(index, control);
+					DeviceManager.AddDevice(control);
+				}
 			}
 
 			_chassis.DMOutputChange += _chassis_OutputChange;
+
+			_namedSlots = new RoutingPortNamedSlots(InputPorts, OutputPorts);
 		}
 
 
@@ -324,8 +356,10 @@ Selector: {4}
 		/// <param name="signalType"></param>
 		public void ExecuteSwitch(object inputSelector, object outputSelector, eRoutingSignalType signalType)
 		{
-			var input = inputSelector as HdPsXxxInput;
-			var output = outputSelector as HdPsXxxOutput;			
+			// Selector may be the port's own Selector object or, from mobile control's matrix
+			// routing, the named slot key (= port key). See RoutingSelectorResolver.
+			var input = RoutingSelectorResolver.Resolve<HdPsXxxInput>(inputSelector, InputPorts);
+			var output = RoutingSelectorResolver.Resolve<HdPsXxxOutput>(outputSelector, OutputPorts);			
 			
 			Debug.LogVerbose(this, "ExecuteSwitch: input={0}, output={1}", input, output);
 
@@ -421,6 +455,8 @@ Selector: {4}
 			{
 				feedback.FireUpdate();
 			}
+
+			SyncCurrentRoutes();
 		}
 
 
@@ -466,6 +502,11 @@ Selector: {4}
 		// _chassis output change event
 		private void _chassis_OutputChange(Switch device, DMOutputEventArgs args)
 		{
+			if (VolumeControls.ContainsKey(args.Number))
+			{
+				VolumeControls[args.Number].VolumeEventFromChassis();
+			}
+
 			if (args.EventId != DMOutputEventIds.VideoOutEventId) return;
 
 			var output = args.Number;
@@ -497,7 +538,79 @@ Selector: {4}
 		{
 			var newEvent = NumericSwitchChange;
 			if (newEvent != null) newEvent(this, args);
+			UpdateCurrentRoute(args);
 		}
+
+		#region IRoutingMidpointWithFeedback Members
+
+		/// <summary>
+		/// Currently active routes, per IRoutingMidpointWithFeedback. Maintained from the device's
+		/// switch-change feedback (see UpdateCurrentRoute / OnSwitchChange).
+		/// </summary>
+		public List<RouteSwitchDescriptor> CurrentRoutes { get; } = new List<RouteSwitchDescriptor>();
+
+		/// <summary>
+		/// Raised when a route changes, per IRoutingMidpointWithFeedback.
+		/// </summary>
+		public event RouteChangedEventHandler RouteChanged;
+
+		/// <summary>
+		/// Clears the route to an output by switching a null input (no source) to it.
+		/// </summary>
+		public void ClearRoute(object outputSelector, eRoutingSignalType signalType)
+		{
+			ExecuteSwitch(null, outputSelector, signalType);
+		}
+
+		/// <summary>
+		/// Maintains <see cref="CurrentRoutes"/> and raises <see cref="RouteChanged"/> from a numeric
+		/// switch-change event so the feedback surface tracks the same routes as NumericSwitchChange.
+		/// </summary>
+		private void UpdateCurrentRoute(RoutingNumericEventArgs e)
+		{
+			if (e == null || e.OutputPort == null)
+				return;
+
+			CurrentRoutes.RemoveAll(r => ReferenceEquals(r.OutputPort, e.OutputPort));
+
+			var descriptor = new RouteSwitchDescriptor(e.OutputPort, e.InputPort);
+			if (e.InputPort != null)
+				CurrentRoutes.Add(descriptor);
+
+			_namedSlots?.HandleRouteChange(e.OutputPort, e.InputPort, e.SigType);
+
+			var handler = RouteChanged;
+			handler?.Invoke(this, descriptor);
+		}
+
+		/// <summary>
+		/// Seeds <see cref="CurrentRoutes"/> (and raises <see cref="RouteChanged"/>) for every output's
+		/// currently-routed input, mirroring what <see cref="_chassis_OutputChange"/> does on a live route
+		/// change. Without this, a route already established on the hardware before Essentials started (or
+		/// before this chassis reconnected) would never be reflected in the IRoutingMidpointWithFeedback
+		/// surface - CurrentRoutes would stay empty until the route actually changed again, which is what
+		/// makes the device appear to have no current route on the devtools Routing page.
+		/// </summary>
+		private void SyncCurrentRoutes()
+		{
+			for (uint i = 1; i <= _chassis.NumberOfOutputs; i++)
+			{
+				if (!OutputNames.ContainsKey(i)) continue;
+
+				var input = _chassis.HdmiDmLiteOutputs[i].VideoOutFeedback == null
+					? 0
+					: _chassis.HdmiDmLiteOutputs[i].VideoOutFeedback.Number;
+
+				var inputPort = InputPorts.FirstOrDefault(
+					p => p.FeedbackMatchObject == _chassis.HdmiDmLiteOutputs[i].VideoOutFeedback);
+				var outputPort = OutputPorts.FirstOrDefault(
+					p => p.FeedbackMatchObject == _chassis.HdmiDmLiteOutputs[i]);
+
+				OnSwitchChange(new RoutingNumericEventArgs(i, input, outputPort, inputPort, eRoutingSignalType.AudioVideo));
+			}
+		}
+
+		#endregion
 
 		// Raise an event when the DM input changes.
 		private void OnDmInputChange(DMInputEventArgs args)
@@ -514,6 +627,131 @@ Selector: {4}
 		
 	}
 
+	public class HdPsAudioOutputController : EssentialsDevice, IBasicVolumeWithFeedback
+	{
+		private readonly HdPsXxxHdmiDmLiteOutputMixer _mixer;
+		private ushort _preMuteVolumeLevel;
+		private bool _isMuted;
+
+		public IntFeedback VolumeLevelFeedback { get; private set; }
+		public BoolFeedback MuteFeedback { get; private set; }
+
+		public HdPsAudioOutputController(string key, string name, HdPsXxxHdmiDmLiteOutputMixer mixer)
+			: base(key, name)
+		{
+			_mixer = mixer;
+			VolumeLevelFeedback = new IntFeedback(() => _mixer.VolumeFeedback.UShortValue);
+			MuteFeedback = new BoolFeedback(() => _isMuted);
+		}
+
+		public void MuteOff()
+		{
+			SetVolume(_preMuteVolumeLevel);
+			_isMuted = false;
+			MuteFeedback.FireUpdate();
+		}
+
+		public void MuteOn()
+		{
+			_preMuteVolumeLevel = _mixer.VolumeFeedback.UShortValue;
+			SetVolume(0);
+			_isMuted = true;
+			MuteFeedback.FireUpdate();
+		}
+
+		public void SetVolume(ushort level)
+		{
+			_mixer.Volume.UShortValue = level;
+		}
+
+		public void MuteToggle()
+		{
+			if (_isMuted)
+				MuteOff();
+			else
+				MuteOn();
+		}
+
+		public void VolumeDown(bool pressRelease)
+		{
+			if (pressRelease)
+				_mixer.Volume.CreateRamp(0, (uint)(400 * (_mixer.VolumeFeedback.UShortValue / 65535.0)));
+			else
+				_mixer.Volume.StopRamp();
+		}
+
+		public void VolumeUp(bool pressRelease)
+		{
+			if (pressRelease)
+				_mixer.Volume.CreateRamp(65535, 400);
+			else
+				_mixer.Volume.StopRamp();
+		}
+
+		internal void VolumeEventFromChassis()
+		{
+			VolumeLevelFeedback.FireUpdate();
+			MuteFeedback.FireUpdate();
+		}
+	}
+
+	public class HdPsAnalogAuxOutputController : EssentialsDevice, IBasicVolumeWithFeedback
+	{
+		private readonly HdPsXxxAnalogAuxMixer _mixer;
+
+		public IntFeedback VolumeLevelFeedback { get; private set; }
+		public BoolFeedback MuteFeedback { get; private set; }
+
+		public HdPsAnalogAuxOutputController(string key, string name, HdPsXxxAnalogAuxMixer mixer)
+			: base(key, name)
+		{
+			_mixer = mixer;
+			VolumeLevelFeedback = new IntFeedback(() => _mixer.VolumeFeedback.UShortValue);
+			MuteFeedback = new BoolFeedback(() => _mixer.AuxiliaryMuteControl.MuteOnFeedback.BoolValue);
+		}
+
+		public void MuteOff()
+		{
+			_mixer.AuxiliaryMuteControl.MuteOff();
+			MuteFeedback.FireUpdate();
+		}
+
+		public void MuteOn()
+		{
+			_mixer.AuxiliaryMuteControl.MuteOn();
+			MuteFeedback.FireUpdate();
+		}
+
+		public void SetVolume(ushort level)
+		{
+			_mixer.Volume.UShortValue = level;
+		}
+
+		public void MuteToggle()
+		{
+			if (_mixer.AuxiliaryMuteControl.MuteOnFeedback.BoolValue)
+				MuteOff();
+			else
+				MuteOn();
+		}
+
+		public void VolumeDown(bool pressRelease)
+		{
+			if (pressRelease)
+				_mixer.Volume.CreateRamp(0, (uint)(400 * (_mixer.VolumeFeedback.UShortValue / 65535.0)));
+			else
+				_mixer.Volume.StopRamp();
+		}
+
+		public void VolumeUp(bool pressRelease)
+		{
+			if (pressRelease)
+				_mixer.Volume.CreateRamp(65535, 400);
+			else
+				_mixer.Volume.StopRamp();
+		}
+	}
+
     #region Factory
 
 
@@ -521,7 +759,7 @@ Selector: {4}
     {
         public HdSp401ControllerFactory()
         {
-            MinimumEssentialsFrameworkVersion = "2.4.5";
+            MinimumEssentialsFrameworkVersion = "3.0.0";
             
             TypeNames = new List<string>() { "hdps401", "hdps402", "hdps621", "hdps622" };
         }
