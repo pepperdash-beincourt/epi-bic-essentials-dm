@@ -25,6 +25,10 @@ namespace PepperDash.Essentials.DM.Chassis
 		// switch-change feedback as CurrentRoutes.
 		private RoutingPortNamedSlots _namedSlots;
 
+		// Sigs already reported as unreadable, so a chassis missing one reports it once rather than on
+		// every feedback update.
+		private readonly HashSet<string> _unreadableSigs = new HashSet<string>();
+
 		IReadOnlyDictionary<string, IRoutingSlotInfo> IHasNamedRoutingSlots.InputSlots =>
 			_namedSlots?.InputSlots ?? new Dictionary<string, IRoutingSlotInfo>();
 		IReadOnlyDictionary<string, IRoutingOutputSlotInfo> IHasNamedRoutingSlots.OutputSlots =>
@@ -92,12 +96,14 @@ namespace PepperDash.Essentials.DM.Chassis
 				});
 
 				VideoInputSyncFeedbacks.Add(new BoolFeedback(inputName,
-					() => _chassis.HdmiInputs[index].VideoDetectedFeedback.BoolValue));
+					() => ReadSig(string.Format("Video detected on input {0}", index),
+						() => _chassis.HdmiInputs[index].VideoDetectedFeedback.BoolValue)));
 
 				InputNameFeedbacks.Add(new StringFeedback(inputName, () => InputNames[index]));
 
 				InputHdcpEnableFeedback.Add(new BoolFeedback(inputName,
-					() => _chassis.HdmiInputs[index].HdmiInputPort.HdcpSupportOnFeedback.BoolValue));
+					() => ReadSig(string.Format("HDCP support on input {0}", index),
+						() => _chassis.HdmiInputs[index].HdmiInputPort.HdcpSupportOnFeedback.BoolValue)));
 			}
 
 			for (uint i = 1; i <= _chassis.NumberOfOutputs; i++)
@@ -131,6 +137,12 @@ namespace PepperDash.Essentials.DM.Chassis
 			_chassis.DMOutputChange += Chassis_DMOutputChange;
 
 			_namedSlots = new RoutingPortNamedSlots(InputPorts, OutputPorts);
+
+			// Subscribed here rather than in LinkToApi: a system with no EISC bridge never calls that
+			// method, and without this the routes the chassis already holds are never read back, so the
+			// device shows no current route until something switches again. After _namedSlots, which the
+			// route sync this handler runs writes through.
+			_chassis.OnlineStatusChange += Chassis_OnlineStatusChange;
 
 			AddPostActivationAction(AddFeedbackCollections);
 		}
@@ -387,8 +399,6 @@ namespace PepperDash.Essentials.DM.Chassis
 					trilist.StringInput[joinMap.OutputRoutedName.JoinNumber + joinIndex]);
 			}
 
-			_chassis.OnlineStatusChange += Chassis_OnlineStatusChange;
-
 			trilist.OnlineStatusChange += (d, args) =>
 			{
 				if (!args.DeviceOnLine) return;
@@ -398,6 +408,29 @@ namespace PepperDash.Essentials.DM.Chassis
 		#endregion
 
 		#region Events
+
+		/// <summary>
+		/// Reads a sig for a feedback, reporting false if this chassis does not implement it.
+		/// </summary>
+		/// <remarks>
+		/// A sig a model does not carry is not null - it is a placeholder that throws when read. These
+		/// funcs run on every online event, where one throw would cost the device the rest of its
+		/// feedbacks, so an input that cannot answer reports false and says so once.
+		/// </remarks>
+		private bool ReadSig(string what, Func<bool> read)
+		{
+			try
+			{
+				return read();
+			}
+			catch (Exception ex)
+			{
+				if (_unreadableSigs.Add(what))
+					Debug.LogWarning(this, "{What} is not readable on this chassis and is reported false: {Message}", what, ex.Message);
+
+				return false;
+			}
+		}
 
 		private void Chassis_OnlineStatusChange(GenericBase currentDevice, OnlineOfflineEventArgs args)
 		{
