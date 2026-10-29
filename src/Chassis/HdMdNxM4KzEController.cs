@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Newtonsoft.Json;
+using Crestron.SimplSharp;
 using Crestron.SimplSharpPro;
 using Crestron.SimplSharpPro.DeviceSupport;
 using Crestron.SimplSharpPro.DM;
@@ -9,13 +10,15 @@ using PepperDash.Core;
 using PepperDash.Essentials.Core;
 using PepperDash.Essentials.Core.Bridges;
 using PepperDash.Essentials.Core.Config;
+using PepperDash.Essentials.Core.DeviceInfo;
 using PepperDash.Essentials.DM.Config;
 using PepperDash.Essentials.DM.Routing;
 
 namespace PepperDash.Essentials.DM.Chassis
 {
 	[Description("Wrapper class for HD-MD-NxM-4KZ-E switchers")]
-	public class HdMdNxM4kzEController : CrestronGenericBridgeableBaseDevice, IRoutingMidpointWithFeedback, IHasNamedRoutingSlots, IHasFeedback
+	public class HdMdNxM4kzEController : CrestronGenericBridgeableBaseDevice, IRoutingMidpointWithFeedback, IHasNamedRoutingSlots, IHasFeedback,
+		IDeviceInfoProvider
 	{
 		private readonly HdMdNxM4kzE _chassis;
 
@@ -446,7 +449,134 @@ namespace PepperDash.Essentials.DM.Chassis
 			AutoRouteFeedback.FireUpdate();
 
 			SyncCurrentRoutes();
+
+			UpdateDeviceInfo();
 		}
+
+		#region IDeviceInfoProvider
+
+		/// <summary>
+		/// The chassis's address, firmware, MAC address and host name. One instance for the life of
+		/// the device, so what is written to it is what readers see.
+		/// </summary>
+		public DeviceInfo DeviceInfo { get; } = new DeviceInfo();
+
+		public event DeviceInfoChangeHandler DeviceInfoChanged;
+
+		private const int CtpPort = 41795;
+
+		// Long enough for a slow console, short enough that a console which asks for a login or never
+		// answers does not hold a socket open.
+		private const long DeviceInfoTimeoutMs = 15000;
+
+		private readonly object _deviceInfoLock = new object();
+		private GenericTcpIpClient _deviceInfoClient;
+
+		/// <summary>
+		/// Records the address the chassis connected from, then asks its console for <c>ver</c> and
+		/// <c>host</c>. Runs each time the chassis comes online; one read at a time.
+		/// </summary>
+		public void UpdateDeviceInfo()
+		{
+			try
+			{
+				var ip = _chassis.ConnectedIpList.Count > 0 ? _chassis.ConnectedIpList[0].DeviceIpAddress : null;
+				if (string.IsNullOrEmpty(ip))
+				{
+					Debug.LogDebug(this, "No connected IP address yet, device info not read");
+					return;
+				}
+
+				DeviceInfo.IpAddress = ip;
+				OnDeviceInfoChanged();
+
+				ReadConsoleInfo(ip);
+			}
+			catch (Exception ex)
+			{
+				Debug.LogDebug(this, "Could not read device info: {0}", ex.Message);
+			}
+		}
+
+		private void ReadConsoleInfo(string ip)
+		{
+			GenericTcpIpClient client;
+			lock (_deviceInfoLock)
+			{
+				if (_deviceInfoClient != null) return;
+
+				client = new GenericTcpIpClient(string.Format("{0}-devInfoSocket", Key), ip, CtpPort, 1024)
+				{
+					AutoReconnect = false,
+				};
+				_deviceInfoClient = client;
+			}
+
+			var gather = new CommunicationGather(client, "\n");
+			var timeout = new CTimer(o => FinishConsoleInfo(client), DeviceInfoTimeoutMs);
+
+			client.ConnectionChange += (sender, args) =>
+			{
+				if (args.Client.IsConnected)
+				{
+					client.SendText("ver\r\n");
+					return;
+				}
+
+				FinishConsoleInfo(client);
+			};
+
+			gather.LineReceived += (sender, args) =>
+			{
+				var ver = CrestronConsoleReply.ParseVer(args.Text);
+				if (ver.Version != null)
+				{
+					DeviceInfo.FirmwareVersion = ver.Version;
+					if (ver.MacAddress != null) DeviceInfo.MacAddress = ver.MacAddress;
+					OnDeviceInfoChanged();
+
+					client.SendText("host\r\n");
+					return;
+				}
+
+				var host = CrestronConsoleReply.ParseHostName(args.Text);
+				if (host == null) return;
+
+				DeviceInfo.HostName = host;
+				OnDeviceInfoChanged();
+
+				timeout.Stop();
+				FinishConsoleInfo(client);
+			};
+
+			client.Connect();
+		}
+
+		private void FinishConsoleInfo(GenericTcpIpClient client)
+		{
+			lock (_deviceInfoLock)
+			{
+				if (_deviceInfoClient != client) return;
+				_deviceInfoClient = null;
+			}
+
+			try
+			{
+				client.Disconnect();
+			}
+			catch (Exception ex)
+			{
+				Debug.LogDebug(this, "Closing the device info connection: {0}", ex.Message);
+			}
+		}
+
+		private void OnDeviceInfoChanged()
+		{
+			var handler = DeviceInfoChanged;
+			if (handler != null) handler(this, new DeviceInfoEventArgs(DeviceInfo));
+		}
+
+		#endregion
 
 		private void Chassis_DMOutputChange(Switch device, DMOutputEventArgs args)
 		{

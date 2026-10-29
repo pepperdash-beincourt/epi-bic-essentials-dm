@@ -41,6 +41,23 @@ public class HdMdNxM4kzESourceTests
             .Should().Be(-1, "subscribing twice would run the handler twice for every event");
     }
 
+    [Fact]
+    public void Reads_Device_Info_Each_Time_The_Chassis_Comes_Online()
+    {
+        // The chassis's IP is only known once it has connected, so the read belongs in the online
+        // handler, after the early return for going offline.
+        var source = Source();
+        var handler = source.IndexOf("private void Chassis_OnlineStatusChange", StringComparison.Ordinal);
+        var offlineReturn = source.IndexOf("if (!args.DeviceOnLine) return;", handler, StringComparison.Ordinal);
+        var update = source.IndexOf("UpdateDeviceInfo();", handler, StringComparison.Ordinal);
+        var nextMember = source.IndexOf("#region IDeviceInfoProvider", handler, StringComparison.Ordinal);
+
+        handler.Should().BeGreaterThan(-1);
+        source.Should().Contain("IDeviceInfoProvider", "the controller must report its device info");
+        update.Should().BeGreaterThan(offlineReturn, "device info is read only once the chassis is online");
+        update.Should().BeLessThan(nextMember, "the read belongs in the online handler");
+    }
+
     [Theory]
     [InlineData("VideoDetectedFeedback.BoolValue")]
     [InlineData("HdcpSupportOnFeedback.BoolValue")]

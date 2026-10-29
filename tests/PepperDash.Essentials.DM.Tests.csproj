@@ -34,5 +34,7 @@
     <Compile Include="..\src\Routing\RoutingPortNamedSlots.cs" Link="Routing\RoutingPortNamedSlots.cs" />
     <!-- Pure-logic slot-key to port-Selector translation, compiled in and exercised directly. -->
     <Compile Include="..\src\Routing\RoutingSelectorResolver.cs" Link="Routing\RoutingSelectorResolver.cs" />
+    <!-- Pure-logic console reply parse (ver, host), compiled in and exercised directly. -->
+    <Compile Include="..\src\Chassis\CrestronConsoleReply.cs" Link="Chassis\CrestronConsoleReply.cs" />
   </ItemGroup>
 </Project>
